@@ -511,8 +511,12 @@ PublicKey = ${CLIENT_PUB_KEY}
 PresharedKey = ${CLIENT_PRE_SHARED_KEY}
 AllowedIPs = ${CLIENT_WG_IPV4}/32,${CLIENT_WG_IPV6}/128" >>"/etc/wireguard/${SERVER_WG_NIC}.conf"
 
-	# 热重载（无需重启服务）
-	wg syncconf "${SERVER_WG_NIC}" <(wg-quick strip "${SERVER_WG_NIC}")
+	# 热重载（无需重启服务）；用临时文件替代进程替换，兼容无 /dev/fd 的系统
+	local _TMP
+	_TMP=$(mktemp)
+	wg-quick strip "${SERVER_WG_NIC}" >"${_TMP}"
+	wg syncconf "${SERVER_WG_NIC}" "${_TMP}"
+	rm -f "${_TMP}"
 
 	echo -e "${GREEN}原生 wg 配置：${HOME_DIR}/${SERVER_WG_NIC}-client-${CLIENT_NAME}.conf${NC}"
 
