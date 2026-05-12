@@ -20,8 +20,27 @@ Linux 一键安装 WireGuard 节点脚本，安装完成后**直接输出 Clash 
 
 ## 快速开始
 
+### 一键安装（推荐）
+
 ```bash
-# 零交互模式（推荐）：全部参数自动取默认值，装完直接打印 Clash 配置
+bash <(curl -fsSL https://raw.githubusercontent.com/MainDotCpp/wireguard-install/main/wireguard-install.sh)
+```
+
+> 需要 root 权限。如果以普通用户运行，前面加 `sudo`：
+> ```bash
+> sudo bash <(curl -fsSL https://raw.githubusercontent.com/MainDotCpp/wireguard-install/main/wireguard-install.sh)
+> ```
+
+安装完成后，Clash 配置文件自动保存到 `/root/wg-clash.yaml`，同时在终端打印预览。
+
+### 本地运行
+
+```bash
+# 下载脚本
+curl -fsSL https://raw.githubusercontent.com/MainDotCpp/wireguard-install/main/wireguard-install.sh -o wireguard-install.sh
+chmod +x wireguard-install.sh
+
+# 零交互模式（推荐）：全部参数自动取默认值
 bash wireguard-install.sh
 
 # 交互模式：逐一确认每个参数
@@ -29,12 +48,6 @@ bash wireguard-install.sh --interactive
 
 # 卸载
 bash wireguard-install.sh --uninstall
-```
-
-### 一键命令（从远程直接跑）
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/your-repo/wireguard-install/main/wireguard-install.sh | bash
 ```
 
 ## 输出文件
