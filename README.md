@@ -23,31 +23,28 @@ Linux 一键安装 WireGuard 节点脚本，安装完成后**直接输出 Clash 
 ### 一键安装（推荐）
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/MainDotCpp/wireguard-install/main/wireguard-install.sh)
+curl -fsSL https://raw.githubusercontent.com/MainDotCpp/wireguard-install/main/wireguard-install.sh | sudo bash
 ```
-
-> 需要 root 权限。如果以普通用户运行，前面加 `sudo`：
-> ```bash
-> sudo bash <(curl -fsSL https://raw.githubusercontent.com/MainDotCpp/wireguard-install/main/wireguard-install.sh)
-> ```
 
 安装完成后，Clash 配置文件自动保存到 `/root/wg-clash.yaml`，同时在终端打印预览。
 
-### 本地运行
+### 先下载再运行（支持交互模式 / 自定义参数）
 
 ```bash
-# 下载脚本
-curl -fsSL https://raw.githubusercontent.com/MainDotCpp/wireguard-install/main/wireguard-install.sh -o wireguard-install.sh
-chmod +x wireguard-install.sh
+curl -fsSL https://raw.githubusercontent.com/MainDotCpp/wireguard-install/main/wireguard-install.sh -o wg-install.sh
+chmod +x wg-install.sh
 
-# 零交互模式（推荐）：全部参数自动取默认值
-bash wireguard-install.sh
+# 零交互（默认）
+sudo bash wg-install.sh
 
 # 交互模式：逐一确认每个参数
-bash wireguard-install.sh --interactive
+sudo bash wg-install.sh --interactive
+
+# 指定端口和节点名
+sudo WG_PORT=51820 WG_NAME=myserver bash wg-install.sh
 
 # 卸载
-bash wireguard-install.sh --uninstall
+sudo bash wg-install.sh --uninstall
 ```
 
 ## 输出文件
