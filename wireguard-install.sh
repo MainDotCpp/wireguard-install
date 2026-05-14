@@ -13,10 +13,12 @@ NC='\033[0m'
 # ---------- 解析命令行参数 ----------
 INTERACTIVE=0
 DO_UNINSTALL=0
+DO_DIAGNOSE=0
 for arg in "$@"; do
 	case "$arg" in
 	--interactive) INTERACTIVE=1 ;;
 	--uninstall) DO_UNINSTALL=1 ;;
+	--diagnose) DO_DIAGNOSE=1 ;;
 	--help)
 		echo "用法: bash $0 [选项]"
 		echo ""
@@ -24,6 +26,7 @@ for arg in "$@"; do
 		echo "  （无参数）      零交互装节点，自动生成 Clash 配置（默认）"
 		echo "  --interactive   交互模式，逐一询问所有参数"
 		echo "  --uninstall     卸载 WireGuard 及所有配置"
+		echo "  --diagnose      诊断 WireGuard 连接问题（超时/无法连接时使用）"
 		echo "  --help          显示此帮助"
 		echo ""
 		echo "环境变量（零交互模式下可覆盖默认值）:"
@@ -141,6 +144,22 @@ function initialCheck() {
 }
 
 # ---------- 参数配置 ----------
+
+# 通过 GeoIP API 检测服务器所在地区代码（如 US、JP、HK）
+function detectRegionCode() {
+	local code
+	code=$(curl -s --max-time 5 https://ipapi.co/${SERVER_PUB_IP}/country/ 2>/dev/null)
+	if [[ -n "${code}" && ${#code} -eq 2 && "${code}" =~ ^[A-Z]{2}$ ]]; then
+		echo "${code}"
+		return
+	fi
+	code=$(curl -s --max-time 5 "http://ip-api.com/line/${SERVER_PUB_IP}?fields=countryCode" 2>/dev/null)
+	if [[ -n "${code}" && ${#code} -eq 2 && "${code}" =~ ^[A-Z]{2}$ ]]; then
+		echo "${code}"
+		return
+	fi
+	echo "XX"
+}
 
 # 通过多个公网 IP 接口获取真实外网地址（解决云厂商 NAT 拿到内网地址的问题）
 function detectPublicIP() {
@@ -316,24 +335,31 @@ ListenPort = ${SERVER_PORT}
 PrivateKey = ${SERVER_PRIV_KEY}" >"/etc/wireguard/${SERVER_WG_NIC}.conf"
 
 	# 防火墙规则：优先 firewalld，否则用 iptables PostUp/PostDown
+	# 规则设计原则：
+	#   1. MASQUERADE 限定源地址为 wg 子网，避免与 Docker/Tailscale 等冲突
+	#   2. 用 -C（check）做幂等，防止重启 WireGuard 时重复添加
+	#   3. FORWARD 规则插入链首（-I），优先于可能存在的 DROP 策略
+	WG_IPV4_SUBNET=$(echo "${SERVER_WG_IPV4}" | cut -d"." -f1-3)".0/24"
+	WG_IPV6_SUBNET=$(echo "${SERVER_WG_IPV6}" | sed 's/:[^:]*$/:0/')"/64"
+
 	if pgrep firewalld; then
 		FIREWALLD_IPV4_ADDRESS=$(echo "${SERVER_WG_IPV4}" | cut -d"." -f1-3)".0"
 		FIREWALLD_IPV6_ADDRESS=$(echo "${SERVER_WG_IPV6}" | sed 's/:[^:]*$/:0/')
 		echo "PostUp = firewall-cmd --zone=public --add-interface=${SERVER_WG_NIC} && firewall-cmd --add-port ${SERVER_PORT}/udp && firewall-cmd --add-rich-rule='rule family=ipv4 source address=${FIREWALLD_IPV4_ADDRESS}/24 masquerade' && firewall-cmd --add-rich-rule='rule family=ipv6 source address=${FIREWALLD_IPV6_ADDRESS}/24 masquerade'
 PostDown = firewall-cmd --zone=public --remove-interface=${SERVER_WG_NIC} && firewall-cmd --remove-port ${SERVER_PORT}/udp && firewall-cmd --remove-rich-rule='rule family=ipv4 source address=${FIREWALLD_IPV4_ADDRESS}/24 masquerade' && firewall-cmd --remove-rich-rule='rule family=ipv6 source address=${FIREWALLD_IPV6_ADDRESS}/24 masquerade'" >>"/etc/wireguard/${SERVER_WG_NIC}.conf"
 	else
-		echo "PostUp = iptables -I INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
-PostUp = iptables -I FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_WG_NIC} -j ACCEPT
-PostUp = iptables -I FORWARD -i ${SERVER_WG_NIC} -j ACCEPT
-PostUp = iptables -t nat -A POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
-PostUp = ip6tables -I FORWARD -i ${SERVER_WG_NIC} -j ACCEPT
-PostUp = ip6tables -t nat -A POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
-PostDown = iptables -D INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
-PostDown = iptables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_WG_NIC} -j ACCEPT
-PostDown = iptables -D FORWARD -i ${SERVER_WG_NIC} -j ACCEPT
-PostDown = iptables -t nat -D POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
-PostDown = ip6tables -D FORWARD -i ${SERVER_WG_NIC} -j ACCEPT
-PostDown = ip6tables -t nat -D POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE" >>"/etc/wireguard/${SERVER_WG_NIC}.conf"
+		echo "PostUp = iptables -C INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
+PostUp = iptables -C FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_WG_NIC} -j ACCEPT 2>/dev/null || iptables -I FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_WG_NIC} -j ACCEPT
+PostUp = iptables -C FORWARD -i ${SERVER_WG_NIC} -j ACCEPT 2>/dev/null || iptables -I FORWARD -i ${SERVER_WG_NIC} -j ACCEPT
+PostUp = iptables -t nat -C POSTROUTING -s ${WG_IPV4_SUBNET} -o ${SERVER_PUB_NIC} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s ${WG_IPV4_SUBNET} -o ${SERVER_PUB_NIC} -j MASQUERADE
+PostUp = ip6tables -C FORWARD -i ${SERVER_WG_NIC} -j ACCEPT 2>/dev/null || ip6tables -I FORWARD -i ${SERVER_WG_NIC} -j ACCEPT
+PostUp = ip6tables -t nat -C POSTROUTING -s ${WG_IPV6_SUBNET} -o ${SERVER_PUB_NIC} -j MASQUERADE 2>/dev/null || ip6tables -t nat -A POSTROUTING -s ${WG_IPV6_SUBNET} -o ${SERVER_PUB_NIC} -j MASQUERADE
+PostDown = iptables -D INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT 2>/dev/null
+PostDown = iptables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_WG_NIC} -j ACCEPT 2>/dev/null
+PostDown = iptables -D FORWARD -i ${SERVER_WG_NIC} -j ACCEPT 2>/dev/null
+PostDown = iptables -t nat -D POSTROUTING -s ${WG_IPV4_SUBNET} -o ${SERVER_PUB_NIC} -j MASQUERADE 2>/dev/null
+PostDown = ip6tables -D FORWARD -i ${SERVER_WG_NIC} -j ACCEPT 2>/dev/null
+PostDown = ip6tables -t nat -D POSTROUTING -s ${WG_IPV6_SUBNET} -o ${SERVER_PUB_NIC} -j MASQUERADE 2>/dev/null" >>"/etc/wireguard/${SERVER_WG_NIC}.conf"
 	fi
 
 	# 开启内核 IP 转发（持久化到 sysctl.d）
@@ -378,6 +404,42 @@ net.ipv6.conf.all.forwarding = 1" >/etc/sysctl.d/wg.conf
 		fi
 	else
 		echo -e "\n${GREEN}WireGuard 服务运行正常。${NC}"
+		verifyIptables
+	fi
+}
+
+# ---------- 安装后验证 ----------
+
+function verifyIptables() {
+	echo -e "\n${BLUE}>>> 验证 iptables 规则${NC}"
+	local OK=1
+	local WG_SUBNET
+	WG_SUBNET=$(echo "${SERVER_WG_IPV4}" | cut -d"." -f1-3)".0/24"
+
+	if iptables -t nat -L POSTROUTING -n 2>/dev/null | grep -q "${WG_SUBNET}"; then
+		echo -e "  ${GREEN}✓ NAT MASQUERADE（${WG_SUBNET} → ${SERVER_PUB_NIC}）${NC}"
+	else
+		echo -e "  ${RED}✗ 缺少 MASQUERADE 规则，流量将无法转发到公网${NC}"
+		OK=0
+	fi
+
+	if iptables -L FORWARD -n 2>/dev/null | grep -q "${SERVER_WG_NIC}"; then
+		echo -e "  ${GREEN}✓ FORWARD 放行 ${SERVER_WG_NIC}${NC}"
+	else
+		echo -e "  ${RED}✗ FORWARD 链未放行 ${SERVER_WG_NIC} 流量${NC}"
+		OK=0
+	fi
+
+	if iptables -L INPUT -n 2>/dev/null | grep -q "udp dpt:${SERVER_PORT}"; then
+		echo -e "  ${GREEN}✓ INPUT 放行 UDP ${SERVER_PORT}${NC}"
+	else
+		echo -e "  ${RED}✗ INPUT 链未放行 UDP ${SERVER_PORT}${NC}"
+		OK=0
+	fi
+
+	if [[ ${OK} -eq 0 ]]; then
+		echo -e "\n${RED}iptables 规则不完整！可能与 Docker/Tailscale 等冲突。${NC}"
+		echo -e "${ORANGE}运行 'bash $0 --diagnose' 获取详细诊断。${NC}"
 	fi
 }
 
@@ -385,54 +447,144 @@ net.ipv6.conf.all.forwarding = 1" >/etc/sysctl.d/wg.conf
 
 function generateClashYaml() {
 	# 所有变量均由调用方（newClient）设置完毕后才调用此函数
-	local CLIENT_PUB_IP="${SERVER_PUB_IP}"
-	# IPv6 地址需要方括号（Clash 配置中直接用裸地址即可，括号由 endpoint 字段处理）
 	local CLASH_SERVER="${SERVER_PUB_IP}"
 	if [[ ${CLASH_SERVER} == *"["* ]]; then
 		CLASH_SERVER="${CLASH_SERVER//[/}"
 		CLASH_SERVER="${CLASH_SERVER//]/}"
 	fi
 	local CLASH_PORT="${SERVER_PORT}"
+	local REGION_CODE
+	REGION_CODE=$(detectRegionCode)
+	local PROXY_NAME="${REGION_CODE}-Wireguard-${CLASH_SERVER}"
 	local OUT="/root/wg-clash.yaml"
 
 	cat >"${OUT}" <<EOF
-# Clash Meta / Mihomo WireGuard 代理配置
-# 由 wireguard-install.sh 自动生成于 $(date '+%Y-%m-%d %H:%M:%S')
-# 使用方法：将下方 proxies 节点复制进 Clash 配置文件，并在 proxy-groups 中引用代理名称
+mixed-port: 7890
+allow-lan: false
+bind-address: "*"
+mode: rule
+log-level: info
+unified-delay: true
+tcp-concurrent: true
+find-process-mode: strict
+global-client-fingerprint: chrome
+
+dns:
+  enable: true
+  listen: 0.0.0.0:1053
+  ipv6: true
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - "*.lan"
+    - "*.local"
+    - localhost.ptlogin2.qq.com
+    - +.stun.*.*
+    - +.stun.*.*.*
+    - dns.msftncsi.com
+    - www.msftncsi.com
+    - www.msftconnecttest.com
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+  nameserver:
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
+  fallback:
+    - https://1.1.1.1/dns-query
+    - https://dns.google/dns-query
+    - tls://8.8.4.4:853
+  fallback-filter:
+    geoip: true
+    geoip-code: CN
+    ipcidr:
+      - 240.0.0.0/4
 
 proxies:
-  - name: "WG-${CLIENT_NAME}"
+  - name: ${PROXY_NAME}
     type: wireguard
-    server: "${CLASH_SERVER}"
+    server: ${CLASH_SERVER}
     port: ${CLASH_PORT}
-    ip: "${CLIENT_WG_IPV4}/32"
-    ipv6: "${CLIENT_WG_IPV6}/128"
-    private-key: "${CLIENT_PRIV_KEY}"
-    public-key: "${SERVER_PUB_KEY}"
-    pre-shared-key: "${CLIENT_PRE_SHARED_KEY}"
+    ip: ${CLIENT_WG_IPV4}
+    ipv6: ${CLIENT_WG_IPV6}
+    private-key: ${CLIENT_PRIV_KEY}
+    public-key: ${SERVER_PUB_KEY}
+    pre-shared-key: ${CLIENT_PRE_SHARED_KEY}
     udp: true
     mtu: 1420
     dns:
-      - "${CLIENT_DNS_1}"
-      - "${CLIENT_DNS_2}"
+      - ${CLIENT_DNS_1}
+      - ${CLIENT_DNS_2}
     workers: 0
+    persistent-keepalive: 25
     remote-dns-resolve: true
     allowed-ips:
-      - "0.0.0.0/0"
-      - "::/0"
+      - 0.0.0.0/0
+      - ::/0
+
+proxy-groups:
+  - name: Proxy
+    type: select
+    proxies:
+      - ${PROXY_NAME}
+      - DIRECT
+
+  - name: Auto
+    type: url-test
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50
+    proxies:
+      - ${PROXY_NAME}
+
+  - name: Streaming
+    type: select
+    proxies:
+      - Proxy
+      - ${PROXY_NAME}
+      - DIRECT
+
+  - name: Global
+    type: select
+    proxies:
+      - Proxy
+      - DIRECT
+      - Auto
+
+  - name: Fallback
+    type: select
+    proxies:
+      - Proxy
+      - DIRECT
+
+rules:
+  - IP-CIDR,127.0.0.0/8,DIRECT
+  - IP-CIDR,192.168.0.0/16,DIRECT
+  - IP-CIDR,10.0.0.0/8,DIRECT
+  - IP-CIDR,172.16.0.0/12,DIRECT
+  - GEOSITE,youtube,Streaming
+  - GEOSITE,netflix,Streaming
+  - GEOSITE,disney,Streaming
+  - GEOSITE,spotify,Streaming
+  - GEOSITE,google,Proxy
+  - GEOSITE,github,Proxy
+  - GEOSITE,telegram,Proxy
+  - GEOSITE,twitter,Proxy
+  - GEOSITE,openai,Proxy
+  - GEOSITE,cn,DIRECT
+  - GEOIP,CN,DIRECT
+  - MATCH,Fallback
 EOF
 
 	echo ""
-	echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━ Clash 配置已生成 ━━━━━━━━━━━━━━━━━━━━━━${NC}"
+	echo -e "${GREEN}━━━━━━━━━━━━━━ Clash Meta 完整配置 ━━━━━━━━━━━━━━${NC}"
 	echo -e "${GREEN}文件路径：${OUT}${NC}"
+	echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 	echo ""
-	echo -e "${BLUE}配置内容预览：${NC}"
 	cat "${OUT}"
 	echo ""
-	echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-	echo ""
-	echo -e "使用方式：将上方 ${ORANGE}proxies${NC} 节点复制到 Clash Meta / Mihomo 配置文件中，"
-	echo -e "然后在 proxy-groups 中添加 ${ORANGE}\"WG-${CLIENT_NAME}\"${NC} 即可使用。"
+	echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+	echo -e "复制以上完整内容到 Clash Meta / Mihomo 配置文件即可使用。"
 }
 
 function newClient() {
@@ -524,6 +676,138 @@ AllowedIPs = ${CLIENT_WG_IPV4}/32,${CLIENT_WG_IPV6}/128" >>"/etc/wireguard/${SER
 	generateClashYaml
 }
 
+# ---------- 诊断 ----------
+
+function diagnoseWg() {
+	echo -e "${BLUE}━━━━━━━━━━━━━━ WireGuard 连接诊断 ━━━━━━━━━━━━━━${NC}"
+	echo ""
+
+	local FAIL=0
+
+	# 1. 检查 WireGuard 服务状态
+	echo -e "${BLUE}[1/7] WireGuard 服务状态${NC}"
+	if command -v systemctl &>/dev/null; then
+		if systemctl is-active --quiet "wg-quick@${SERVER_WG_NIC}"; then
+			echo -e "  ${GREEN}✓ wg-quick@${SERVER_WG_NIC} 正在运行${NC}"
+		else
+			echo -e "  ${RED}✗ wg-quick@${SERVER_WG_NIC} 未运行${NC}"
+			echo -e "  ${ORANGE}  修复：sudo systemctl restart wg-quick@${SERVER_WG_NIC}${NC}"
+			FAIL=1
+		fi
+	elif command -v rc-service &>/dev/null; then
+		if rc-service --quiet "wg-quick.${SERVER_WG_NIC}" status; then
+			echo -e "  ${GREEN}✓ wg-quick.${SERVER_WG_NIC} 正在运行${NC}"
+		else
+			echo -e "  ${RED}✗ wg-quick.${SERVER_WG_NIC} 未运行${NC}"
+			FAIL=1
+		fi
+	fi
+
+	# 2. 检查 wg 接口是否存在
+	echo -e "${BLUE}[2/7] WireGuard 接口${NC}"
+	if ip link show "${SERVER_WG_NIC}" &>/dev/null; then
+		echo -e "  ${GREEN}✓ 接口 ${SERVER_WG_NIC} 存在${NC}"
+	else
+		echo -e "  ${RED}✗ 接口 ${SERVER_WG_NIC} 不存在${NC}"
+		echo -e "  ${ORANGE}  修复：sudo systemctl restart wg-quick@${SERVER_WG_NIC}${NC}"
+		FAIL=1
+	fi
+
+	# 3. 检查 IP 转发
+	echo -e "${BLUE}[3/7] IP 转发${NC}"
+	local IPV4_FWD
+	IPV4_FWD=$(sysctl -n net.ipv4.ip_forward 2>/dev/null)
+	if [[ "${IPV4_FWD}" == "1" ]]; then
+		echo -e "  ${GREEN}✓ IPv4 转发已开启${NC}"
+	else
+		echo -e "  ${RED}✗ IPv4 转发未开启（当前值：${IPV4_FWD}）${NC}"
+		echo -e "  ${ORANGE}  修复：sudo sysctl -w net.ipv4.ip_forward=1${NC}"
+		FAIL=1
+	fi
+
+	# 4. 检查 UDP 端口监听
+	echo -e "${BLUE}[4/7] UDP 端口监听${NC}"
+	if ss -ulnp 2>/dev/null | grep -q ":${SERVER_PORT} " || ss -ulnp 2>/dev/null | grep -q ":${SERVER_PORT}\b"; then
+		echo -e "  ${GREEN}✓ UDP 端口 ${SERVER_PORT} 正在监听${NC}"
+	else
+		echo -e "  ${RED}✗ UDP 端口 ${SERVER_PORT} 未监听${NC}"
+		echo -e "  ${ORANGE}  WireGuard 可能未正确启动${NC}"
+		FAIL=1
+	fi
+
+	# 5. 检查 iptables NAT 规则
+	echo -e "${BLUE}[5/7] iptables NAT/MASQUERADE${NC}"
+	if iptables -t nat -L POSTROUTING -n 2>/dev/null | grep -qi "MASQUERADE"; then
+		echo -e "  ${GREEN}✓ MASQUERADE 规则已生效${NC}"
+	else
+		echo -e "  ${RED}✗ 未检测到 MASQUERADE 规则${NC}"
+		echo -e "  ${ORANGE}  修复：sudo systemctl restart wg-quick@${SERVER_WG_NIC}${NC}"
+		FAIL=1
+	fi
+
+	# 6. 检查 FORWARD 链默认策略和规则
+	echo -e "${BLUE}[6/7] iptables FORWARD 链${NC}"
+	local FWD_POLICY
+	FWD_POLICY=$(iptables -L FORWARD -n 2>/dev/null | head -1 | grep -oP '\(policy \K[A-Z]+')
+	if iptables -L FORWARD -n 2>/dev/null | grep -q "${SERVER_WG_NIC}"; then
+		echo -e "  ${GREEN}✓ FORWARD 链包含 ${SERVER_WG_NIC} 规则${NC}"
+	elif [[ "${FWD_POLICY}" == "ACCEPT" ]]; then
+		echo -e "  ${GREEN}✓ FORWARD 链默认策略为 ACCEPT${NC}"
+	else
+		echo -e "  ${RED}✗ FORWARD 链可能阻止了 WireGuard 流量（默认策略：${FWD_POLICY}）${NC}"
+		echo -e "  ${ORANGE}  修复：sudo systemctl restart wg-quick@${SERVER_WG_NIC}${NC}"
+		FAIL=1
+	fi
+
+	# 7. 检查 peer 握手状态
+	echo -e "${BLUE}[7/7] Peer 握手状态${NC}"
+	local WG_OUTPUT
+	WG_OUTPUT=$(wg show "${SERVER_WG_NIC}" 2>/dev/null)
+	if [[ -z "${WG_OUTPUT}" ]]; then
+		echo -e "  ${RED}✗ 无法读取 wg 接口信息${NC}"
+		FAIL=1
+	else
+		local PEER_COUNT
+		PEER_COUNT=$(echo "${WG_OUTPUT}" | grep -c "^peer:")
+		echo -e "  已注册 peer 数：${GREEN}${PEER_COUNT}${NC}"
+
+		local HANDSHAKE_LINES
+		HANDSHAKE_LINES=$(echo "${WG_OUTPUT}" | grep "latest handshake")
+		if [[ -n "${HANDSHAKE_LINES}" ]]; then
+			echo -e "  ${GREEN}✓ 存在握手记录：${NC}"
+			echo "${HANDSHAKE_LINES}" | while read -r line; do
+				echo -e "    ${line}"
+			done
+		else
+			echo -e "  ${ORANGE}⚠ 无握手记录 — 客户端可能从未成功连接${NC}"
+			echo -e "  ${ORANGE}  最可能原因：云服务器安全组/防火墙未放行 UDP ${SERVER_PORT}${NC}"
+		fi
+	fi
+
+	# 汇总
+	echo ""
+	echo -e "${BLUE}━━━━━━━━━━━━━━ 诊断结论 ━━━━━━━━━━━━━━${NC}"
+	if [[ ${FAIL} -eq 0 ]]; then
+		echo -e "${GREEN}服务端配置正常。${NC}"
+		echo ""
+		echo -e "如果仍然超时，请检查："
+		echo -e "  ${ORANGE}1. 云服务器安全组/防火墙是否放行了 UDP ${SERVER_PORT}${NC}"
+		echo -e "  ${ORANGE}2. Clash 配置中的 server 地址和端口是否正确${NC}"
+		echo -e "  ${ORANGE}3. 本地网络是否屏蔽了 UDP 流量（部分公司/校园网会封）${NC}"
+	else
+		echo -e "${RED}发现 ${FAIL} 个问题，请按上方提示逐一修复。${NC}"
+	fi
+	echo ""
+
+	# 附加：输出关键配置摘要
+	echo -e "${BLUE}关键配置摘要：${NC}"
+	echo -e "  公网 IP：${SERVER_PUB_IP}"
+	echo -e "  监听端口：${SERVER_PORT}/UDP"
+	echo -e "  wg 接口：${SERVER_WG_NIC}"
+	echo -e "  出口网卡：${SERVER_PUB_NIC}"
+	echo ""
+}
+
 # ---------- 卸载 ----------
 
 function uninstallWg() {
@@ -593,6 +877,18 @@ function uninstallWg() {
 # ============================================================
 # 主入口
 # ============================================================
+
+# 诊断模式
+if [[ ${DO_DIAGNOSE} -eq 1 ]]; then
+	isRoot
+	if [[ ! -e /etc/wireguard/params ]]; then
+		echo -e "${ORANGE}未检测到 WireGuard 安装记录（/etc/wireguard/params 不存在）。${NC}"
+		exit 1
+	fi
+	source /etc/wireguard/params
+	diagnoseWg
+	exit 0
+fi
 
 # 卸载模式：直接处理，不需要 initialCheck
 if [[ ${DO_UNINSTALL} -eq 1 ]]; then
