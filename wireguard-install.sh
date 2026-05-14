@@ -404,42 +404,81 @@ net.ipv6.conf.all.forwarding = 1" >/etc/sysctl.d/wg.conf
 		fi
 	else
 		echo -e "\n${GREEN}WireGuard 服务运行正常。${NC}"
-		verifyIptables
+		verifyAndFixIptables
 	fi
 }
 
-# ---------- 安装后验证 ----------
+# ---------- 安装后验证与自动修复 ----------
 
-function verifyIptables() {
+function verifyAndFixIptables() {
 	echo -e "\n${BLUE}>>> 验证 iptables 规则${NC}"
-	local OK=1
+	local FIXED=0
 	local WG_SUBNET
 	WG_SUBNET=$(echo "${SERVER_WG_IPV4}" | cut -d"." -f1-3)".0/24"
+	local WG_IPV6_SUBNET
+	WG_IPV6_SUBNET=$(echo "${SERVER_WG_IPV6}" | sed 's/:[^:]*$/:0/')"/64"
+	local IPT
+	IPT=$(command -v iptables)
+	local IP6T
+	IP6T=$(command -v ip6tables)
 
-	if iptables -t nat -L POSTROUTING -n 2>/dev/null | grep -q "${WG_SUBNET}"; then
-		echo -e "  ${GREEN}✓ NAT MASQUERADE（${WG_SUBNET} → ${SERVER_PUB_NIC}）${NC}"
-	else
-		echo -e "  ${RED}✗ 缺少 MASQUERADE 规则，流量将无法转发到公网${NC}"
-		OK=0
-	fi
-
-	if iptables -L FORWARD -n 2>/dev/null | grep -q "${SERVER_WG_NIC}"; then
-		echo -e "  ${GREEN}✓ FORWARD 放行 ${SERVER_WG_NIC}${NC}"
-	else
-		echo -e "  ${RED}✗ FORWARD 链未放行 ${SERVER_WG_NIC} 流量${NC}"
-		OK=0
-	fi
-
-	if iptables -L INPUT -n 2>/dev/null | grep -q "udp dpt:${SERVER_PORT}"; then
+	# INPUT：放行 WireGuard UDP 端口
+	if ${IPT} -L INPUT -n 2>/dev/null | grep -q "udp dpt:${SERVER_PORT}"; then
 		echo -e "  ${GREEN}✓ INPUT 放行 UDP ${SERVER_PORT}${NC}"
 	else
-		echo -e "  ${RED}✗ INPUT 链未放行 UDP ${SERVER_PORT}${NC}"
-		OK=0
+		${IPT} -I INPUT -p udp --dport "${SERVER_PORT}" -j ACCEPT
+		echo -e "  ${ORANGE}⚡ INPUT 放行 UDP ${SERVER_PORT}（已自动修复）${NC}"
+		FIXED=$((FIXED + 1))
 	fi
 
-	if [[ ${OK} -eq 0 ]]; then
-		echo -e "\n${RED}iptables 规则不完整！可能与 Docker/Tailscale 等冲突。${NC}"
-		echo -e "${ORANGE}运行 'bash $0 --diagnose' 获取详细诊断。${NC}"
+	# FORWARD：放行 wg 接口双向流量
+	if ${IPT} -L FORWARD -n 2>/dev/null | grep -q "${SERVER_WG_NIC}"; then
+		echo -e "  ${GREEN}✓ FORWARD 放行 ${SERVER_WG_NIC}${NC}"
+	else
+		${IPT} -I FORWARD -i "${SERVER_PUB_NIC}" -o "${SERVER_WG_NIC}" -j ACCEPT
+		${IPT} -I FORWARD -i "${SERVER_WG_NIC}" -j ACCEPT
+		${IP6T} -I FORWARD -i "${SERVER_WG_NIC}" -j ACCEPT 2>/dev/null
+		echo -e "  ${ORANGE}⚡ FORWARD 放行 ${SERVER_WG_NIC}（已自动修复）${NC}"
+		FIXED=$((FIXED + 1))
+	fi
+
+	# NAT MASQUERADE：限定 wg 子网源地址
+	if ${IPT} -t nat -L POSTROUTING -n 2>/dev/null | grep -q "${WG_SUBNET}"; then
+		echo -e "  ${GREEN}✓ NAT MASQUERADE（${WG_SUBNET} → ${SERVER_PUB_NIC}）${NC}"
+	else
+		${IPT} -t nat -A POSTROUTING -s "${WG_SUBNET}" -o "${SERVER_PUB_NIC}" -j MASQUERADE
+		${IP6T} -t nat -A POSTROUTING -s "${WG_IPV6_SUBNET}" -o "${SERVER_PUB_NIC}" -j MASQUERADE 2>/dev/null
+		echo -e "  ${ORANGE}⚡ NAT MASQUERADE ${WG_SUBNET}（已自动修复）${NC}"
+		FIXED=$((FIXED + 1))
+	fi
+
+	if [[ ${FIXED} -gt 0 ]]; then
+		echo -e "\n${ORANGE}PostUp 规则未自动生效，已通过脚本直接修复 ${FIXED} 条规则。${NC}"
+		echo -e "${ORANGE}提示：可能是 iptables 路径问题。正在修补 wg 配置中的 PostUp...${NC}"
+		fixPostUpPaths
+	fi
+}
+
+# 将 wg 配置中的 iptables/ip6tables 替换为绝对路径，防止 wg-quick 因 PATH 不同而找不到
+function fixPostUpPaths() {
+	local CONF="/etc/wireguard/${SERVER_WG_NIC}.conf"
+	local IPT_PATH
+	IPT_PATH=$(command -v iptables)
+	local IP6T_PATH
+	IP6T_PATH=$(command -v ip6tables)
+
+	if [[ -z "${IPT_PATH}" ]]; then
+		return
+	fi
+
+	if grep -q "PostUp = iptables " "${CONF}" 2>/dev/null; then
+		sed -i "s|PostUp = iptables |PostUp = ${IPT_PATH} |g" "${CONF}"
+		sed -i "s|PostDown = iptables |PostDown = ${IPT_PATH} |g" "${CONF}"
+		if [[ -n "${IP6T_PATH}" ]]; then
+			sed -i "s|PostUp = ip6tables |PostUp = ${IP6T_PATH} |g" "${CONF}"
+			sed -i "s|PostDown = ip6tables |PostDown = ${IP6T_PATH} |g" "${CONF}"
+		fi
+		echo -e "  ${GREEN}✓ 已将 PostUp/PostDown 中的 iptables 替换为绝对路径：${IPT_PATH}${NC}"
 	fi
 }
 
